@@ -3,18 +3,25 @@ from __future__ import annotations
 """
 EXPERIMENTO_NICHOS_KEYWORD_IDEAS_PLANNER.py
 
-Fluxo correto: Google Ads API via REST direto.
+Fluxo validado: Google Ads API via REST direto.
 - GenerateKeywordIdeas
 - GenerateKeywordHistoricalMetrics
 - sem GoogleAdsClient
 - sem Google Trends
 - sem criar/alterar campanhas
 
+Esta versão possui CHECKPOINT persistente:
+- salva cada página concluída de Keyword Ideas;
+- salva cada lote concluído de Historical Metrics;
+- se a execução cair, a próxima execução retoma do último checkpoint;
+- garante pelo menos 5 segundos entre chamadas HTTP à Google Ads API.
+
 Ao terminar, envie para o ChatGPT:
 resultado_experimento_keywords_rest/05_RESULTADO_PARA_CHATGPT.txt
 """
 
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -30,7 +37,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 
 # =============================================================================
-# CONFIGURAÇÃO — MESMO PADRÃO DO DEMO REST VALIDADO
+# CONFIGURAÇÃO — PADRÃO REST VALIDADO
 # =============================================================================
 
 API_VERSION = "v25"
@@ -60,6 +67,7 @@ OUTPUT_KEYWORDS_CSV = OUTPUT_DIR / "03_keywords_detalhadas.csv"
 OUTPUT_SUMMARY_CSV = OUTPUT_DIR / "04_resumo_nichos.csv"
 OUTPUT_CHATGPT_TXT = OUTPUT_DIR / "05_RESULTADO_PARA_CHATGPT.txt"
 OUTPUT_ANALYSIS_JSON = OUTPUT_DIR / "06_analise_completa.json"
+CHECKPOINT_PATH = OUTPUT_DIR / "checkpoint.json"
 
 TIMEOUT_SECONDS = 180
 MAX_RETRIES = 3
@@ -68,9 +76,16 @@ TRANSIENT_HTTP = {429, 500, 502, 503, 504}
 PAGE_SIZE = 1000
 TOP_IDEAS_PER_NICHE = 50
 HISTORICAL_BATCH_SIZE = 500
-PAUSE_SECONDS = 1.0
+
+# Mínimo entre o término de uma chamada HTTP e o início da próxima.
+CALL_INTERVAL_SECONDS = 5.0
+
+# Coloque True somente se quiser ignorar/apagar o checkpoint e começar do zero.
+RESET_CHECKPOINT = False
+CHECKPOINT_VERSION = 2
 
 STARTED = time.perf_counter()
+LAST_HTTP_CALL_FINISHED = None
 
 
 # =============================================================================
@@ -80,78 +95,107 @@ STARTED = time.perf_counter()
 NICHES = {
     "assistencia_celular": {
         "label": "Assistência técnica de celulares",
-        "seeds": ["assistência técnica celular", "conserto de celular",
-                  "troca de tela celular", "conserto iphone"],
+        "seeds": [
+            "assistência técnica celular", "conserto de celular",
+            "troca de tela celular", "conserto iphone",
+        ],
     },
     "baterias_automotivas": {
         "label": "Loja de baterias automotivas",
-        "seeds": ["bateria automotiva", "bateria de carro",
-                  "troca de bateria carro", "loja de bateria automotiva"],
+        "seeds": [
+            "bateria automotiva", "bateria de carro",
+            "troca de bateria carro", "loja de bateria automotiva",
+        ],
     },
     "grafica_comunicacao_visual": {
         "label": "Gráfica rápida / comunicação visual",
-        "seeds": ["gráfica rápida", "gráfica", "comunicação visual",
-                  "impressão gráfica"],
+        "seeds": [
+            "gráfica rápida", "gráfica", "comunicação visual",
+            "impressão gráfica",
+        ],
     },
     "despachante_veicular": {
         "label": "Despachante veicular",
-        "seeds": ["despachante veicular", "despachante de veículos",
-                  "despachante documentação veículo"],
+        "seeds": [
+            "despachante veicular", "despachante de veículos",
+            "despachante documentação veículo",
+        ],
     },
     "autoescola": {
         "label": "Autoescola independente",
-        "seeds": ["autoescola", "auto escola", "carteira de motorista",
-                  "aulas de direção"],
+        "seeds": [
+            "autoescola", "auto escola", "carteira de motorista",
+            "aulas de direção",
+        ],
     },
     "pet_shop_banho_tosa": {
         "label": "Pet shop + banho e tosa",
-        "seeds": ["pet shop", "banho e tosa", "banho para cachorro",
-                  "tosa de cachorro"],
+        "seeds": [
+            "pet shop", "banho e tosa", "banho para cachorro",
+            "tosa de cachorro",
+        ],
     },
     "floricultura": {
         "label": "Floricultura",
-        "seeds": ["floricultura", "flores", "buquê de flores",
-                  "entrega de flores"],
+        "seeds": [
+            "floricultura", "flores", "buquê de flores",
+            "entrega de flores",
+        ],
     },
     "barbearia": {
         "label": "Barbearia",
-        "seeds": ["barbearia", "barbeiro", "corte masculino",
-                  "corte de barba"],
+        "seeds": [
+            "barbearia", "barbeiro", "corte masculino", "corte de barba",
+        ],
     },
     "centro_automotivo": {
         "label": "Centro automotivo / pneus e alinhamento",
-        "seeds": ["centro automotivo", "loja de pneus",
-                  "alinhamento e balanceamento", "troca de pneus"],
+        "seeds": [
+            "centro automotivo", "loja de pneus",
+            "alinhamento e balanceamento", "troca de pneus",
+        ],
     },
     "auto_eletrica": {
         "label": "Auto elétrica",
-        "seeds": ["auto elétrica", "eletricista automotivo",
-                  "conserto elétrico carro"],
+        "seeds": [
+            "auto elétrica", "eletricista automotivo",
+            "conserto elétrico carro",
+        ],
     },
     "estetica_automotiva": {
         "label": "Estética automotiva / detalhamento",
-        "seeds": ["estética automotiva", "detalhamento automotivo",
-                  "polimento automotivo", "higienização automotiva"],
+        "seeds": [
+            "estética automotiva", "detalhamento automotivo",
+            "polimento automotivo", "higienização automotiva",
+        ],
     },
     "lavanderia": {
         "label": "Lavanderia",
-        "seeds": ["lavanderia", "lavanderia de roupas", "lavagem de roupa",
-                  "lavanderia self service"],
+        "seeds": [
+            "lavanderia", "lavanderia de roupas", "lavagem de roupa",
+            "lavanderia self service",
+        ],
     },
     "locadora_ferramentas": {
         "label": "Locadora de ferramentas / equipamentos",
-        "seeds": ["aluguel de ferramentas", "locação de ferramentas",
-                  "aluguel de equipamentos", "locadora de ferramentas"],
+        "seeds": [
+            "aluguel de ferramentas", "locação de ferramentas",
+            "aluguel de equipamentos", "locadora de ferramentas",
+        ],
     },
     "salao_beleza": {
         "label": "Salão de beleza independente",
-        "seeds": ["salão de beleza", "cabeleireiro",
-                  "corte de cabelo feminino", "escova cabelo"],
+        "seeds": [
+            "salão de beleza", "cabeleireiro",
+            "corte de cabelo feminino", "escova cabelo",
+        ],
     },
     "esmalteria_nail": {
         "label": "Esmalteria / nail studio",
-        "seeds": ["esmalteria", "manicure", "nail designer",
-                  "alongamento de unhas"],
+        "seeds": [
+            "esmalteria", "manicure", "nail designer",
+            "alongamento de unhas",
+        ],
     },
 }
 
@@ -230,16 +274,122 @@ def fmt_pct(value):
 
 
 def fmt_money(value):
-    return (f"R$ {value:,.2f}"
-            .replace(",", "X").replace(".", ",").replace("X", "."))
+    return (
+        f"R$ {value:,.2f}"
+        .replace(",", "X").replace(".", ",").replace("X", ".")
+    )
 
 
 def avg(values):
     return sum(values) / len(values) if values else 0.0
 
 
+def stable_hash(value) -> str:
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 # =============================================================================
-# OAUTH / HEADERS — COPIADO DO FLUXO REST CORRETO
+# CHECKPOINT
+# =============================================================================
+
+def checkpoint_signature() -> str:
+    return stable_hash(
+        {
+            "api_version": API_VERSION,
+            "manager_id": only_digits(MANAGER_ID),
+            "customer_id": only_digits(CUSTOMER_ID),
+            "geo_target": GEO_TARGET,
+            "language": LANGUAGE,
+            "network": NETWORK,
+            "page_size": PAGE_SIZE,
+            "top_ideas_per_niche": TOP_IDEAS_PER_NICHE,
+            "historical_batch_size": HISTORICAL_BATCH_SIZE,
+            "niches": NICHES,
+        }
+    )
+
+
+def fresh_checkpoint() -> dict:
+    return {
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "signature": checkpoint_signature(),
+        "phase1": {},
+        "phase2": {
+            "keywords_hash": None,
+            "completed_batches": {},
+            "completed": False,
+        },
+    }
+
+
+def save_checkpoint(checkpoint: dict) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = CHECKPOINT_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(checkpoint, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(CHECKPOINT_PATH)
+
+
+def load_checkpoint() -> dict:
+    if RESET_CHECKPOINT and CHECKPOINT_PATH.exists():
+        CHECKPOINT_PATH.unlink()
+        log("RESET_CHECKPOINT=True: checkpoint antigo apagado.")
+
+    if not CHECKPOINT_PATH.exists():
+        checkpoint = fresh_checkpoint()
+        save_checkpoint(checkpoint)
+        log(f"Checkpoint novo: {CHECKPOINT_PATH}")
+        return checkpoint
+
+    try:
+        checkpoint = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        broken = CHECKPOINT_PATH.with_name(
+            f"checkpoint_corrompido_{int(time.time())}.json"
+        )
+        CHECKPOINT_PATH.replace(broken)
+        log(f"Checkpoint corrompido movido para: {broken}")
+        log(f"Motivo: {exc}")
+        checkpoint = fresh_checkpoint()
+        save_checkpoint(checkpoint)
+        return checkpoint
+
+    if (
+        checkpoint.get("checkpoint_version") != CHECKPOINT_VERSION
+        or checkpoint.get("signature") != checkpoint_signature()
+    ):
+        old = CHECKPOINT_PATH.with_name(
+            f"checkpoint_incompativel_{int(time.time())}.json"
+        )
+        CHECKPOINT_PATH.replace(old)
+        log(f"Checkpoint incompatível preservado em: {old}")
+        checkpoint = fresh_checkpoint()
+        save_checkpoint(checkpoint)
+        return checkpoint
+
+    completed_niches = sum(
+        1
+        for state in checkpoint.get("phase1", {}).values()
+        if state.get("completed")
+    )
+    historical_batches = len(
+        checkpoint.get("phase2", {}).get("completed_batches", {})
+    )
+
+    log(
+        f"Checkpoint carregado: {completed_niches}/{len(NICHES)} nichos "
+        f"de Ideas completos | {historical_batches} lote(s) históricos salvos."
+    )
+    return checkpoint
+
+
+# =============================================================================
+# OAUTH / HEADERS — FLUXO REST CORRETO
 # =============================================================================
 
 def find_token_cache() -> Path:
@@ -338,18 +488,52 @@ def build_headers(creds, developer_token, manager_id):
 
 
 # =============================================================================
-# HTTP REST COM RETENTATIVA — MESMO FLUXO DO DEMO
+# HTTP REST COM RETENTATIVA + 5 SEGUNDOS ENTRE CHAMADAS
 # =============================================================================
 
+def wait_for_api_spacing() -> None:
+    global LAST_HTTP_CALL_FINISHED
+
+    if LAST_HTTP_CALL_FINISHED is None:
+        return
+
+    elapsed_since_last = time.perf_counter() - LAST_HTTP_CALL_FINISHED
+    remaining = CALL_INTERVAL_SECONDS - elapsed_since_last
+
+    if remaining > 0:
+        log(f"Aguardando {remaining:.1f}s antes da próxima chamada à API...")
+        time.sleep(remaining)
+
+
 def post_google_ads(url, headers, payload):
+    global LAST_HTTP_CALL_FINISHED
+
     last_status = None
+    last_exception = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        response = requests.post(
-            url, headers=headers, json=payload, timeout=TIMEOUT_SECONDS
-        )
-        last_status = response.status_code
+        wait_for_api_spacing()
 
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=TIMEOUT_SECONDS,
+            )
+            LAST_HTTP_CALL_FINISHED = time.perf_counter()
+        except requests.RequestException as exc:
+            LAST_HTTP_CALL_FINISHED = time.perf_counter()
+            last_exception = exc
+            log(
+                f"Falha HTTP de transporte | tentativa "
+                f"{attempt}/{MAX_RETRIES}: {exc}"
+            )
+            if attempt == MAX_RETRIES:
+                raise
+            continue
+
+        last_status = response.status_code
         request_id = (
             response.headers.get("request-id")
             or response.headers.get("x-request-id")
@@ -376,9 +560,13 @@ def post_google_ads(url, headers, payload):
         if response.status_code not in TRANSIENT_HTTP or attempt == MAX_RETRIES:
             break
 
-        wait = attempt * 2
-        log(f"Erro transitório. Tentando novamente em {wait}s...")
-        time.sleep(wait)
+        log(
+            f"Erro transitório; nova tentativa respeitará o intervalo "
+            f"mínimo de {CALL_INTERVAL_SECONDS:.0f}s."
+        )
+
+    if last_exception is not None and last_status is None:
+        raise RuntimeError(f"Google Ads API falhou: {last_exception}")
 
     raise RuntimeError(
         f"Google Ads API falhou. Último HTTP={last_status}."
@@ -386,55 +574,11 @@ def post_google_ads(url, headers, payload):
 
 
 # =============================================================================
-# FASE 1 — GENERATE KEYWORD IDEAS
+# FASE 1 — GENERATE KEYWORD IDEAS + CHECKPOINT POR PÁGINA
 # =============================================================================
 
-def generate_keyword_ideas(headers, customer_id, niche_key, config):
-    url = (
-        f"https://googleads.googleapis.com/{API_VERSION}/"
-        f"customers/{customer_id}:generateKeywordIdeas"
-    )
-
+def finalize_ideas_result(niche_key, config, all_results, raw_pages):
     seeds = unique(config["seeds"])
-    all_results = []
-    raw_pages = []
-    page_token = None
-    page_number = 0
-
-    while True:
-        page_number += 1
-        payload = {
-            "geoTargetConstants": [GEO_TARGET],
-            "language": LANGUAGE,
-            "keywordPlanNetwork": NETWORK,
-            "includeAdultKeywords": False,
-            "historicalMetricsOptions": {"includeAverageCpc": True},
-            "keywordSeed": {"keywords": seeds},
-            "pageSize": PAGE_SIZE,
-        }
-
-        if page_token:
-            payload["pageToken"] = page_token
-
-        log(
-            f"Keyword Ideas | {config['label']} | página {page_number}"
-        )
-        body = post_google_ads(url, headers, payload)
-        raw_pages.append(body)
-
-        page_results = body.get("results", []) or []
-        all_results.extend(page_results)
-
-        log(
-            f"{config['label']}: +{len(page_results)} "
-            f"| acumulado={len(all_results)}"
-        )
-
-        page_token = body.get("nextPageToken")
-        if not page_token:
-            break
-
-        time.sleep(PAUSE_SECONDS)
 
     ranked = sorted(
         all_results,
@@ -465,22 +609,122 @@ def generate_keyword_ideas(headers, customer_id, niche_key, config):
     }
 
 
-def run_all_ideas(headers, customer_id):
+def generate_keyword_ideas(
+    headers,
+    customer_id,
+    niche_key,
+    config,
+    checkpoint,
+):
+    url = (
+        f"https://googleads.googleapis.com/{API_VERSION}/"
+        f"customers/{customer_id}:generateKeywordIdeas"
+    )
+
+    phase1 = checkpoint.setdefault("phase1", {})
+    state = phase1.setdefault(
+        niche_key,
+        {
+            "completed": False,
+            "next_page_token": None,
+            "raw_pages": [],
+            "ideas": [],
+            "result": None,
+        },
+    )
+
+    if state.get("completed") and state.get("result"):
+        result = state["result"]
+        log(
+            f"CHECKPOINT | {config['label']}: já concluído "
+            f"({result.get('ideas_count', 0)} ideias)."
+        )
+        return result
+
+    seeds = unique(config["seeds"])
+    all_results = list(state.get("ideas", []) or [])
+    raw_pages = list(state.get("raw_pages", []) or [])
+    page_token = state.get("next_page_token")
+    page_number = len(raw_pages)
+
+    if raw_pages or all_results or page_token:
+        log(
+            f"RETOMANDO | {config['label']} | "
+            f"páginas salvas={len(raw_pages)} | ideias={len(all_results)}"
+        )
+
+    while True:
+        page_number += 1
+
+        payload = {
+            "geoTargetConstants": [GEO_TARGET],
+            "language": LANGUAGE,
+            "keywordPlanNetwork": NETWORK,
+            "includeAdultKeywords": False,
+            "historicalMetricsOptions": {"includeAverageCpc": True},
+            "keywordSeed": {"keywords": seeds},
+            "pageSize": PAGE_SIZE,
+        }
+
+        if page_token:
+            payload["pageToken"] = page_token
+
+        log(f"Keyword Ideas | {config['label']} | página {page_number}")
+        body = post_google_ads(url, headers, payload)
+
+        raw_pages.append(body)
+        page_results = body.get("results", []) or []
+        all_results.extend(page_results)
+        page_token = body.get("nextPageToken")
+
+        state["raw_pages"] = raw_pages
+        state["ideas"] = all_results
+        state["next_page_token"] = page_token
+        save_checkpoint(checkpoint)
+
+        log(
+            f"{config['label']}: +{len(page_results)} | "
+            f"acumulado={len(all_results)} | checkpoint salvo"
+        )
+
+        if not page_token:
+            break
+
+    result = finalize_ideas_result(
+        niche_key,
+        config,
+        all_results,
+        raw_pages,
+    )
+
+    state["completed"] = True
+    state["next_page_token"] = None
+    state["result"] = result
+    save_checkpoint(checkpoint)
+
+    return result
+
+
+def run_all_ideas(headers, customer_id, checkpoint):
     data = {}
 
     for i, (niche_key, config) in enumerate(NICHES.items(), start=1):
         log("=" * 78)
         log(f"NICHO {i}/{len(NICHES)} — {config['label']}")
+
         result = generate_keyword_ideas(
-            headers, customer_id, niche_key, config
+            headers,
+            customer_id,
+            niche_key,
+            config,
+            checkpoint,
         )
         data[niche_key] = result
+
         log(
             f"Ideias={result['ideas_count']} | "
             f"termos p/ histórico={len(result['selected_keywords'])}"
         )
-        if i < len(NICHES):
-            time.sleep(PAUSE_SECONDS)
 
     OUTPUT_IDEAS_JSON.write_text(
         json.dumps(
@@ -502,7 +746,7 @@ def run_all_ideas(headers, customer_id):
 
 
 # =============================================================================
-# FASE 2 — GENERATE KEYWORD HISTORICAL METRICS
+# FASE 2 — GENERATE KEYWORD HISTORICAL METRICS + CHECKPOINT POR LOTE
 # =============================================================================
 
 def build_contexts(all_niches):
@@ -544,23 +788,98 @@ def generate_historical_metrics(headers, customer_id, keywords):
     return post_google_ads(url, headers, payload)
 
 
-def run_historical(headers, customer_id, all_niches):
+def map_historical_body(body, contexts):
+    mapped = []
+
+    for result in body.get("results", []) or []:
+        canonical = str(result.get("text", "") or "")
+        close_variants = [
+            str(x) for x in (result.get("closeVariants", []) or [])
+        ]
+
+        matched_contexts = []
+        seen = set()
+
+        for candidate in unique([canonical] + close_variants):
+            for ctx in contexts.get(norm(candidate), []):
+                key = (
+                    ctx["niche_key"],
+                    ctx["local_requested"],
+                    norm(ctx["requested_keyword"]),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    matched_contexts.append(ctx)
+
+        mapped.append(
+            {
+                "canonical_text": canonical,
+                "close_variants": close_variants,
+                "contexts": matched_contexts,
+                "raw": result,
+            }
+        )
+
+    return mapped
+
+
+def run_historical(headers, customer_id, all_niches, checkpoint):
     all_keywords, contexts = build_contexts(all_niches)
     batches = list(chunks(all_keywords, HISTORICAL_BATCH_SIZE))
 
+    phase2 = checkpoint.setdefault("phase2", {})
+    keywords_hash = stable_hash(all_keywords)
+
+    if phase2.get("keywords_hash") != keywords_hash:
+        if phase2.get("completed_batches"):
+            log(
+                "A lista de keywords mudou. O checkpoint da Fase 2 será "
+                "reiniciado; a Fase 1 permanece preservada."
+            )
+        phase2.clear()
+        phase2.update(
+            {
+                "keywords_hash": keywords_hash,
+                "completed_batches": {},
+                "completed": False,
+            }
+        )
+        save_checkpoint(checkpoint)
+
+    completed_batches = phase2.setdefault("completed_batches", {})
     raw_batches = []
     mapped = []
 
     log(f"Termos históricos únicos: {len(all_keywords)}")
 
     for i, keyword_batch in enumerate(batches, start=1):
-        log(
-            f"Historical lote {i}/{len(batches)} "
-            f"| {len(keyword_batch)} termos"
-        )
-        body = generate_historical_metrics(
-            headers, customer_id, keyword_batch
-        )
+        batch_key = str(i)
+        saved = completed_batches.get(batch_key)
+
+        if saved:
+            log(
+                f"CHECKPOINT | Historical lote {i}/{len(batches)} "
+                f"já concluído; reutilizando resposta salva."
+            )
+            body = saved["response"]
+        else:
+            log(
+                f"Historical lote {i}/{len(batches)} | "
+                f"{len(keyword_batch)} termos"
+            )
+            body = generate_historical_metrics(
+                headers,
+                customer_id,
+                keyword_batch,
+            )
+
+            completed_batches[batch_key] = {
+                "batch_number": i,
+                "keywords_requested": keyword_batch,
+                "response": body,
+            }
+            save_checkpoint(checkpoint)
+            log(f"Historical lote {i}: checkpoint salvo.")
 
         raw_batches.append(
             {
@@ -569,38 +888,10 @@ def run_historical(headers, customer_id, all_niches):
                 "response": body,
             }
         )
+        mapped.extend(map_historical_body(body, contexts))
 
-        for result in body.get("results", []) or []:
-            canonical = str(result.get("text", "") or "")
-            close_variants = [
-                str(x) for x in (result.get("closeVariants", []) or [])
-            ]
-
-            matched_contexts = []
-            seen = set()
-
-            for candidate in unique([canonical] + close_variants):
-                for ctx in contexts.get(norm(candidate), []):
-                    key = (
-                        ctx["niche_key"],
-                        ctx["local_requested"],
-                        norm(ctx["requested_keyword"]),
-                    )
-                    if key not in seen:
-                        seen.add(key)
-                        matched_contexts.append(ctx)
-
-            mapped.append(
-                {
-                    "canonical_text": canonical,
-                    "close_variants": close_variants,
-                    "contexts": matched_contexts,
-                    "raw": result,
-                }
-            )
-
-        if i < len(batches):
-            time.sleep(PAUSE_SECONDS)
+    phase2["completed"] = True
+    save_checkpoint(checkpoint)
 
     OUTPUT_HISTORICAL_JSON.write_text(
         json.dumps(
@@ -648,7 +939,7 @@ def parse_series(metrics):
 
 
 def parse_mapped_result(mapped):
-    metrics = (mapped["raw"].get("keywordMetrics") or {})
+    metrics = mapped["raw"].get("keywordMetrics") or {}
     series = parse_series(metrics)
 
     all_values = [x["searches"] for x in series]
@@ -1034,10 +1325,12 @@ def main():
     log("=" * 78)
     log("EXPERIMENTO NICHOS — GOOGLE ADS API REST")
     log("Keyword Ideas + Historical Metrics")
+    log("CHECKPOINT ATIVO | 5s ENTRE CHAMADAS HTTP")
     log("SEM GoogleAdsClient | SEM Google Trends")
     log("=" * 78)
 
     developer_token, manager_id, customer_id = require_config()
+    checkpoint = load_checkpoint()
 
     log(f"API: {API_VERSION}")
     log(f"Manager ID: {manager_id}")
@@ -1046,19 +1339,23 @@ def main():
     log(f"Idioma: {LANGUAGE}")
     log(f"Rede: {NETWORK}")
     log(f"Nichos: {len(NICHES)}")
+    log(f"Intervalo entre chamadas: {CALL_INTERVAL_SECONDS:.1f}s")
+    log(f"Checkpoint: {CHECKPOINT_PATH}")
     log(f"Saída: {OUTPUT_DIR}")
 
     creds = get_credentials()
-    headers = build_headers(
-        creds, developer_token, manager_id
-    )
+    headers = build_headers(creds, developer_token, manager_id)
 
     log("")
     log("=" * 78)
     log("FASE 1 — GENERATE KEYWORD IDEAS")
     log("=" * 78)
 
-    all_niches = run_all_ideas(headers, customer_id)
+    all_niches = run_all_ideas(
+        headers,
+        customer_id,
+        checkpoint,
+    )
 
     log("")
     log("=" * 78)
@@ -1066,7 +1363,10 @@ def main():
     log("=" * 78)
 
     mapped = run_historical(
-        headers, customer_id, all_niches
+        headers,
+        customer_id,
+        all_niches,
+        checkpoint,
     )
 
     rows = []
@@ -1098,6 +1398,7 @@ def main():
     log(f"Historical JSON: {OUTPUT_HISTORICAL_JSON}")
     log(f"Resumo CSV: {OUTPUT_SUMMARY_CSV}")
     log(f"Arquivo p/ ChatGPT: {OUTPUT_CHATGPT_TXT}")
+    log(f"Checkpoint: {CHECKPOINT_PATH}")
     log(f"Tempo total: {elapsed()}")
     log("=" * 78)
 
@@ -1106,9 +1407,9 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("Execução interrompida pelo usuário.")
+        log("Execução interrompida pelo usuário. O checkpoint foi preservado.")
         sys.exit(130)
     except Exception as exc:
-        log("ERRO")
+        log("ERRO — o checkpoint já salvo foi preservado.")
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         raise
